@@ -75,6 +75,8 @@ struct PinRuntimeState {
   int lastPhysicalValue;
   int stablePhysicalValue;
   unsigned long lastDebounceTime;
+  float temperature;
+  float humidity;
 };
 
 constexpr size_t PIN_CONFIG_COUNT =
@@ -942,6 +944,8 @@ void initializePinStates() {
     pinStates[index].lastPhysicalValue = -1;
     pinStates[index].stablePhysicalValue = -1;
     pinStates[index].lastDebounceTime = 0;
+    pinStates[index].temperature = NAN;
+    pinStates[index].humidity = NAN;
 
     if (isOutputMode(pinStates[index].mode)) {
       pinMode(pinStates[index].gpio, OUTPUT);
@@ -1112,8 +1116,13 @@ int readRuntimeValue(PinRuntimeState &pinState) {
           unsigned long now = millis();
           if (now - lastDHTReadTime[index] >= 2000) {
             float t = dhtSensors[index]->readTemperature();
+            float h = dhtSensors[index]->readHumidity();
             if (!isnan(t)) {
+              pinState.temperature = t;
               pinState.value = (int)(t * 10);
+            }
+            if (!isnan(h)) {
+              pinState.humidity = h;
             }
             lastDHTReadTime[index] = now;
           }
@@ -1224,11 +1233,21 @@ void publishState(bool applied) {
     JsonObject pin = pins.createNestedObject();
     pin["pin"] = pinState.gpio;
     pin["mode"] = pinState.mode;
-    pin["value"] = readRuntimeValue(pinState);
+    const int runtimeValue = readRuntimeValue(pinState);
+    pin["value"] = runtimeValue;
     if (isOutputMode(pinState.mode)) {
       pin["active_level"] = pinState.activeLevel;
     }
     appendPinConfigMetadata(pin, ECONNECT_PIN_CONFIGS[index]);
+
+    if (strcmp(ECONNECT_PIN_CONFIGS[index].input_type, "dht") == 0) {
+      if (!isnan(pinState.temperature)) {
+        pin["temperature"] = serialized(String(pinState.temperature, 1));
+      }
+      if (!isnan(pinState.humidity)) {
+        pin["humidity"] = serialized(String(pinState.humidity, 1));
+      }
+    }
 
     const int brightness = readRuntimeBrightness(pinState);
     if (brightness > 0 || isPwmMode(pinState.mode)) {
@@ -1251,6 +1270,14 @@ void publishState(bool applied) {
       PinRuntimeState &pinState = pinStates[0];
       doc["pin"] = pinState.gpio;
       doc["value"] = readRuntimeValue(pinState);
+      if (strcmp(ECONNECT_PIN_CONFIGS[0].input_type, "dht") == 0) {
+        if (!isnan(pinState.temperature)) {
+          doc["temperature"] = serialized(String(pinState.temperature, 1));
+        }
+        if (!isnan(pinState.humidity)) {
+          doc["humidity"] = serialized(String(pinState.humidity, 1));
+        }
+      }
       if (isPwmMode(pinState.mode)) {
         doc["brightness"] = readRuntimeBrightness(pinState);
       }
@@ -1297,6 +1324,19 @@ void appendPinConfigMetadata(JsonObject pin, const EConnectPinConfig &config) {
       extraParams["i2c_library"] = config.i2c_library;
       hasExtraParams = true;
     }
+  }
+
+  if (strlen(config.input_type) > 0) {
+    extraParams["input_type"] = config.input_type;
+    hasExtraParams = true;
+  }
+  if (strlen(config.switch_type) > 0) {
+    extraParams["switch_type"] = config.switch_type;
+    hasExtraParams = true;
+  }
+  if (strlen(config.dht_version) > 0) {
+    extraParams["dht_version"] = config.dht_version;
+    hasExtraParams = true;
   }
 
   if (!hasExtraParams) {
