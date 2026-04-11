@@ -57,6 +57,9 @@ static const EConnectPinConfig ECONNECT_PIN_CONFIGS[] = {
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000;
 constexpr unsigned long HANDSHAKE_RETRY_DELAY_MS = 5000;
 constexpr unsigned long HANDSHAKE_ACK_TIMEOUT_MS = 5000;
+constexpr unsigned long MQTT_RECONNECT_RETRY_DELAY_MS = 1500;
+constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 30;
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_SECONDS = 10;
 constexpr int WIFI_RETRY_LIMIT = 40;
 
 struct PinRuntimeState {
@@ -152,6 +155,11 @@ template <typename TDocument> void appendEmbeddedNetworkTargets(TDocument &doc);
 bool runtimeNetworkDiffers(JsonVariantConst runtimeNetwork);
 void requireManualReflash(JsonVariantConst runtimeNetwork,
                           const String &message);
+const char *wifiStatusName(wl_status_t status);
+void logConnectivitySnapshot(const char *context);
+void markMqttConnectionFaulted(const char *context);
+bool publishMqttPayload(const String &topic, const String &payload,
+                        const char *context);
 
 void setup() {
   Serial.begin(115200);
@@ -289,7 +297,10 @@ void loop() {
     reconnectMQTT();
   }
 
-  mqttClient.loop();
+  if (mqttClient.connected() && !mqttClient.loop()) {
+    Serial.println("mqttClient.loop() reported a transport problem.");
+    markMqttConnectionFaulted("mqttClient.loop()");
+  }
 
 #ifdef BOARD_JC3827W543
   if (mqttClient.connected()) {
@@ -461,6 +472,79 @@ void formatBssid(const uint8_t *bssid, char *buffer, size_t bufferSize) {
            bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 }
 
+const char *wifiStatusName(wl_status_t status) {
+  switch (status) {
+#ifdef WL_IDLE_STATUS
+  case WL_IDLE_STATUS:
+    return "WL_IDLE_STATUS";
+#endif
+#ifdef WL_NO_SSID_AVAIL
+  case WL_NO_SSID_AVAIL:
+    return "WL_NO_SSID_AVAIL";
+#endif
+#ifdef WL_SCAN_COMPLETED
+  case WL_SCAN_COMPLETED:
+    return "WL_SCAN_COMPLETED";
+#endif
+#ifdef WL_CONNECTED
+  case WL_CONNECTED:
+    return "WL_CONNECTED";
+#endif
+#ifdef WL_CONNECT_FAILED
+  case WL_CONNECT_FAILED:
+    return "WL_CONNECT_FAILED";
+#endif
+#ifdef WL_CONNECTION_LOST
+  case WL_CONNECTION_LOST:
+    return "WL_CONNECTION_LOST";
+#endif
+#ifdef WL_DISCONNECTED
+  case WL_DISCONNECTED:
+    return "WL_DISCONNECTED";
+#endif
+  default:
+    return "WL_UNKNOWN";
+  }
+}
+
+void logConnectivitySnapshot(const char *context) {
+  const wl_status_t wifiStatus = WiFi.status();
+  const String ipAddress = WiFi.localIP().toString();
+  Serial.printf(
+      "%s | WiFi.status()=%d (%s) | mqttClient.state()=%d | "
+      "mqttClient.connected()=%s | IP=%s\n",
+      context, static_cast<int>(wifiStatus), wifiStatusName(wifiStatus),
+      mqttClient.state(), mqttClient.connected() ? "true" : "false",
+      ipAddress.c_str());
+}
+
+void markMqttConnectionFaulted(const char *context) {
+  Serial.printf("%s | Forcing MQTT disconnect to recover transport.\n",
+                context);
+  logConnectivitySnapshot(context);
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  lastReconnectAttemptAt = millis() - MQTT_RECONNECT_RETRY_DELAY_MS;
+}
+
+bool publishMqttPayload(const String &topic, const String &payload,
+                        const char *context) {
+  if (!mqttClient.connected()) {
+    Serial.printf("%s skipped because MQTT is disconnected.\n", context);
+    logConnectivitySnapshot(context);
+    return false;
+  }
+
+  if (mqttClient.publish(topic.c_str(), payload.c_str())) {
+    return true;
+  }
+
+  Serial.printf("%s publish failed.\n", context);
+  markMqttConnectionFaulted(context);
+  return false;
+}
+
 bool performSecureHandshake() {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
@@ -510,15 +594,24 @@ bool performSecureHandshake() {
   Serial.printf("Publishing secure handshake to MQTT topic: %s\n",
                 topic.c_str());
 
-  if (!mqttClient.publish(topic.c_str(), requestBody.c_str())) {
-    Serial.println("Failed to publish secure handshake over MQTT.");
+  if (!publishMqttPayload(topic, requestBody, "Secure handshake")) {
     return false;
   }
 
   const unsigned long startedAt = millis();
   while (!securePairingVerified && !pairingRejectedUntilPowerCycle &&
          millis() - startedAt < HANDSHAKE_ACK_TIMEOUT_MS) {
-    mqttClient.loop();
+    if (!mqttClient.connected()) {
+      Serial.println(
+          "MQTT disconnected while waiting for pairing acknowledgement.");
+      break;
+    }
+    if (!mqttClient.loop()) {
+      Serial.println(
+          "mqttClient.loop() failed while waiting for pairing acknowledgement.");
+      markMqttConnectionFaulted("Secure handshake ack wait");
+      break;
+    }
     delay(10);
   }
 
@@ -545,6 +638,10 @@ void setupMQTT() {
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(4096);
+  mqttClient.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SECONDS);
+  Serial.printf("MQTT configured with keepalive=%us socket_timeout=%us\n",
+                MQTT_KEEPALIVE_SECONDS, MQTT_SOCKET_TIMEOUT_SECONDS);
 }
 
 String commandTopic() {
@@ -589,8 +686,12 @@ void reconnectMQTT() {
   if (mqttClient.connected())
     return;
 
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
   unsigned long now = millis();
-  if (now - lastReconnectAttemptAt < HANDSHAKE_RETRY_DELAY_MS)
+  if (now - lastReconnectAttemptAt < MQTT_RECONNECT_RETRY_DELAY_MS)
     return;
 
   lastReconnectAttemptAt = now;
@@ -600,9 +701,9 @@ void reconnectMQTT() {
   clientId += "-";
   clientId += String(random(0xffff), HEX);
 
-  Serial.print("Attempting MQTT connection...");
+  logConnectivitySnapshot("Attempting MQTT reconnect");
   if (mqttClient.connect(clientId.c_str())) {
-    Serial.println(" connected");
+    Serial.println("MQTT connected.");
     subscribeRegisterAckTopic();
     subscribeStateAckTopic();
     if (securePairingVerified) {
@@ -614,8 +715,9 @@ void reconnectMQTT() {
       lastHeartbeatAt = millis();
     }
   } else {
-    Serial.print(" failed, rc=");
+    Serial.print("MQTT connect failed, rc=");
     Serial.println(mqttClient.state());
+    logConnectivitySnapshot("MQTT reconnect failed");
     Serial.println("If the server was moved to a new IP, rebuild and reflash "
                    "this board so the embedded server/MQTT host is updated.");
   }
@@ -783,9 +885,10 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
         serializeJson(statusDoc, payload);
         const String stateTopic = String("econnect/") + MQTT_NAMESPACE +
                                   "/device/" + deviceId + "/state";
-        mqttClient.publish(stateTopic.c_str(), payload.c_str());
-        mqttClient.loop();
-        delay(500);
+        if (publishMqttPayload(stateTopic, payload, "OTA status")) {
+          mqttClient.loop();
+          delay(500);
+        }
 
         if (otaResult.shouldRestart) {
           ESP.restart();
@@ -1157,11 +1260,11 @@ void publishState(bool applied) {
   String payload;
   serializeJson(doc, payload);
 
-  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
+  if (publishMqttPayload(stateTopic, payload,
+                         applied ? "Applied state payload"
+                                 : "Heartbeat state payload")) {
     Serial.println("Published state payload:");
     Serial.println(payload);
-  } else {
-    Serial.println("Failed to publish state payload.");
   }
 }
 
