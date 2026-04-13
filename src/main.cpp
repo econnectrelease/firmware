@@ -113,6 +113,8 @@ bool forcePairingRequestOnNextHandshake = false;
 bool pairingRejectedUntilPowerCycle = false;
 bool manualReflashRequired = false;
 unsigned long lastReconnectAttemptAt = 0;
+bool deferredStatePublishPending = false;
+bool deferredStatePublishApplied = false;
 
 bool connectToWiFi();
 bool performSecureHandshake();
@@ -120,6 +122,15 @@ void setupMQTT();
 void reconnectMQTT();
 void mqttCallback(char *topic, byte *payload, unsigned int length);
 void publishState(bool applied);
+void publishFailedCommandAck(const String &commandId);
+void publishPinCommandAckState(const EConnectPinConfig &config,
+                               const PinRuntimeState &pinState,
+                               const String &commandId);
+#ifdef BOARD_JC3827W543
+void publishBuiltinCommandAckState(const String &commandId);
+#endif
+void queueDeferredStatePublish(bool applied);
+void flushDeferredStatePublish();
 String commandTopic();
 String registerTopic();
 String registerAckTopic();
@@ -154,6 +165,9 @@ const char *getActiveWifiSsid();
 const char *wifiPassphrase();
 size_t totalReportedPinCount();
 template <typename TDocument> void appendEmbeddedNetworkTargets(TDocument &doc);
+template <typename TDocument>
+void appendStateEnvelope(TDocument &doc, bool applied,
+                         const String *commandId = nullptr);
 bool runtimeNetworkDiffers(JsonVariantConst runtimeNetwork);
 void requireManualReflash(JsonVariantConst runtimeNetwork,
                           const String &message);
@@ -309,6 +323,8 @@ void loop() {
     jc3827w543_publish_pending_command(mqttClient);
   }
 #endif
+
+  flushDeferredStatePublish();
 
   if (millis() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
     publishState(false);
@@ -907,12 +923,18 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   const int targetPin = doc["pin"] | -1;
   const int value = doc["value"] | -1;
   const int brightness = doc["brightness"] | -1;
+  const String commandId = doc["command_id"] | "";
 
 #ifdef BOARD_JC3827W543
   if (jc3827w543_is_builtin_pin(targetPin)) {
     const bool applied =
         jc3827w543_apply_builtin_command(targetPin, value, brightness);
-    publishState(applied);
+    if (applied) {
+      publishBuiltinCommandAckState(commandId);
+      queueDeferredStatePublish(true);
+    } else {
+      publishFailedCommandAck(commandId);
+    }
     return;
   }
 #endif
@@ -920,13 +942,19 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   const int pinIndex = findPinIndex(targetPin);
   if (pinIndex < 0) {
     Serial.printf("Ignoring command for unmapped GPIO %d\n", targetPin);
-    publishState(false);
+    publishFailedCommandAck(commandId);
     return;
   }
 
   const bool applied =
       applyCommandToPin(pinStates[pinIndex], value, brightness);
-  publishState(applied);
+  if (applied) {
+    publishPinCommandAckState(ECONNECT_PIN_CONFIGS[pinIndex],
+                              pinStates[pinIndex], commandId);
+    queueDeferredStatePublish(true);
+  } else {
+    publishFailedCommandAck(commandId);
+  }
 }
 
 void initializePinStates() {
@@ -1210,6 +1238,134 @@ int resolvePhysicalLevel(const PinRuntimeState &pinState, int logicalValue) {
   return normalizedLogical == 1 ? activeLevel : (activeLevel == 1 ? 0 : 1);
 }
 
+template <typename TDocument>
+void appendStateEnvelope(TDocument &doc, bool applied,
+                         const String *commandId) {
+  doc["kind"] = "state";
+  doc["device_id"] = deviceId;
+  doc["applied"] = applied;
+  doc["firmware_revision"] = ECONNECT_FIRMWARE_REVISION;
+  doc["firmware_version"] = ECONNECT_FIRMWARE_VERSION;
+  doc["ip_address"] = WiFi.localIP().toString();
+  if (commandId != nullptr && commandId->length() > 0) {
+    doc["command_id"] = *commandId;
+  }
+  appendEmbeddedNetworkTargets(doc);
+}
+
+void publishFailedCommandAck(const String &commandId) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  const String stateTopic =
+      String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
+
+  DynamicJsonDocument doc(512);
+  appendStateEnvelope(doc, false, &commandId);
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
+    Serial.println("Published failed command acknowledgement payload:");
+    Serial.println(payload);
+  } else {
+    Serial.println("Failed to publish failed command acknowledgement payload.");
+  }
+}
+
+void publishPinCommandAckState(const EConnectPinConfig &config,
+                               const PinRuntimeState &pinState,
+                               const String &commandId) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  const String stateTopic =
+      String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
+  const bool pwmMode = isPwmMode(config.mode);
+
+  DynamicJsonDocument doc(1024);
+  appendStateEnvelope(doc, true, &commandId);
+  doc["pin"] = pinState.gpio;
+  doc["mode"] = pinState.mode;
+  doc["value"] = pinState.value;
+  if (pwmMode) {
+    doc["brightness"] = pinState.brightness;
+  }
+
+  JsonArray pins = doc.createNestedArray("pins");
+  JsonObject pin = pins.createNestedObject();
+  pin["pin"] = pinState.gpio;
+  pin["mode"] = pinState.mode;
+  pin["value"] = pinState.value;
+  if (isOutputMode(config.mode)) {
+    pin["active_level"] = pinState.activeLevel;
+  }
+  appendPinConfigMetadata(pin, config);
+  if (pwmMode) {
+    pin["brightness"] = pinState.brightness;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
+    Serial.println("Published fast command acknowledgement payload:");
+    Serial.println(payload);
+  } else {
+    Serial.println("Failed to publish fast command acknowledgement payload.");
+  }
+}
+
+#ifdef BOARD_JC3827W543
+void publishBuiltinCommandAckState(const String &commandId) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  const String stateTopic =
+      String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
+
+  DynamicJsonDocument doc(1024);
+  appendStateEnvelope(doc, true, &commandId);
+  doc["pin"] = jc3827w543_builtin_pin();
+  doc["mode"] = "PWM";
+  doc["value"] = jc3827w543_builtin_value();
+  doc["brightness"] = jc3827w543_builtin_brightness();
+
+  JsonArray pins = doc.createNestedArray("pins");
+  jc3827w543_append_builtin_pin_state(pins);
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
+    Serial.println("Published fast built-in command acknowledgement payload:");
+    Serial.println(payload);
+  } else {
+    Serial.println(
+        "Failed to publish fast built-in command acknowledgement payload.");
+  }
+}
+#endif
+
+void queueDeferredStatePublish(bool applied) {
+  deferredStatePublishPending = true;
+  deferredStatePublishApplied = applied;
+}
+
+void flushDeferredStatePublish() {
+  if (!deferredStatePublishPending || !mqttClient.connected()) {
+    return;
+  }
+
+  const bool applied = deferredStatePublishApplied;
+  deferredStatePublishPending = false;
+  publishState(applied);
+}
+
 void publishState(bool applied) {
   if (!mqttClient.connected()) {
     return;
@@ -1219,13 +1375,7 @@ void publishState(bool applied) {
       String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
 
   DynamicJsonDocument doc(4096);
-  doc["kind"] = "state";
-  doc["device_id"] = deviceId;
-  doc["applied"] = applied;
-  doc["firmware_revision"] = ECONNECT_FIRMWARE_REVISION;
-  doc["firmware_version"] = ECONNECT_FIRMWARE_VERSION;
-  doc["ip_address"] = WiFi.localIP().toString();
-  appendEmbeddedNetworkTargets(doc);
+  appendStateEnvelope(doc, applied);
 
   JsonArray pins = doc.createNestedArray("pins");
   for (size_t index = 0; index < PIN_CONFIG_COUNT; index++) {
