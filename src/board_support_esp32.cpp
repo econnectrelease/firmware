@@ -6,6 +6,10 @@
 #include <esp_attr.h>
 #include <WiFiClientSecure.h>
 
+#ifndef ECONNECT_WIFI_SLEEP
+#define ECONNECT_WIFI_SLEEP 0
+#endif
+
 namespace {
 constexpr uint32_t kRuntimeFlagsMagic = 0x45434E54;  // "ECNT"
 constexpr uint32_t kRuntimeFlagsVersion = 1;
@@ -124,11 +128,11 @@ void initializeBoardNetworking() {
 void prepareBoardForWifiConnection() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
-  WiFi.setSleep(false);
+  WiFi.setSleep(ECONNECT_WIFI_SLEEP != 0);
   // Allow the driver to consider any 2.4 GHz AP security mode it supports.
   // The provisioning layer still controls what credentials the product accepts.
   WiFi.setMinSecurity(WIFI_AUTH_OPEN);
-  WiFi.disconnect(false, true);
+  WiFi.disconnect(false, false);
 }
 
 int32_t defaultBoardAuthMode() {

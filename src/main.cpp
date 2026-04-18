@@ -30,6 +30,42 @@
 #define ECONNECT_FIRMWARE_REVISION "1.0.0"
 #endif
 
+#ifndef ECONNECT_DEBUG_SERIAL
+#define ECONNECT_DEBUG_SERIAL 0
+#endif
+
+#ifndef ECONNECT_WIFI_SCAN_BEFORE_CONNECT
+#define ECONNECT_WIFI_SCAN_BEFORE_CONNECT 0
+#endif
+
+#ifndef ECONNECT_HEARTBEAT_INTERVAL_MS
+#define ECONNECT_HEARTBEAT_INTERVAL_MS 5000UL
+#endif
+
+#ifndef ECONNECT_HANDSHAKE_RETRY_DELAY_MS
+#define ECONNECT_HANDSHAKE_RETRY_DELAY_MS 5000UL
+#endif
+
+#ifndef ECONNECT_HANDSHAKE_ACK_TIMEOUT_MS
+#define ECONNECT_HANDSHAKE_ACK_TIMEOUT_MS 5000UL
+#endif
+
+#ifndef ECONNECT_MQTT_RECONNECT_RETRY_DELAY_MS
+#define ECONNECT_MQTT_RECONNECT_RETRY_DELAY_MS 2500UL
+#endif
+
+#ifndef ECONNECT_MQTT_KEEPALIVE_SECONDS
+#define ECONNECT_MQTT_KEEPALIVE_SECONDS 10
+#endif
+
+#ifndef ECONNECT_MQTT_SOCKET_TIMEOUT_SECONDS
+#define ECONNECT_MQTT_SOCKET_TIMEOUT_SECONDS 3
+#endif
+
+#ifndef ECONNECT_WIFI_CONNECT_TIMEOUT_MS
+#define ECONNECT_WIFI_CONNECT_TIMEOUT_MS 12000UL
+#endif
+
 #ifndef ECONNECT_HAS_PIN_CONFIGS
 struct EConnectPinConfig {
   int gpio;
@@ -54,13 +90,19 @@ static const EConnectPinConfig ECONNECT_PIN_CONFIGS[] = {
 };
 #endif
 
-constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000;
-constexpr unsigned long HANDSHAKE_RETRY_DELAY_MS = 5000;
-constexpr unsigned long HANDSHAKE_ACK_TIMEOUT_MS = 5000;
-constexpr unsigned long MQTT_RECONNECT_RETRY_DELAY_MS = 1500;
-constexpr uint16_t MQTT_KEEPALIVE_SECONDS = 30;
-constexpr uint16_t MQTT_SOCKET_TIMEOUT_SECONDS = 10;
-constexpr int WIFI_RETRY_LIMIT = 40;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS =
+    ECONNECT_HEARTBEAT_INTERVAL_MS;
+constexpr unsigned long HANDSHAKE_RETRY_DELAY_MS =
+    ECONNECT_HANDSHAKE_RETRY_DELAY_MS;
+constexpr unsigned long HANDSHAKE_ACK_TIMEOUT_MS =
+    ECONNECT_HANDSHAKE_ACK_TIMEOUT_MS;
+constexpr unsigned long MQTT_RECONNECT_RETRY_DELAY_MS =
+    ECONNECT_MQTT_RECONNECT_RETRY_DELAY_MS;
+constexpr uint16_t MQTT_KEEPALIVE_SECONDS = ECONNECT_MQTT_KEEPALIVE_SECONDS;
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_SECONDS =
+    ECONNECT_MQTT_SOCKET_TIMEOUT_SECONDS;
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS =
+    ECONNECT_WIFI_CONNECT_TIMEOUT_MS;
 
 struct PinRuntimeState {
   int gpio;
@@ -142,6 +184,9 @@ void initializePinStates();
 void initializeI2CBus();
 int findPinIndex(int gpio);
 void appendPinConfigMetadata(JsonObject pin, const EConnectPinConfig &config);
+void appendRuntimePinState(JsonObject pin, PinRuntimeState &pinState,
+                           const EConnectPinConfig &config,
+                           bool includeMetadata);
 bool modeEquals(const char *left, const char *right);
 bool isOutputMode(const char *mode);
 bool isPwmMode(const char *mode);
@@ -158,9 +203,11 @@ int readRuntimeValue(PinRuntimeState &pinState);
 int readRuntimeBrightness(PinRuntimeState &pinState);
 bool applyCommandToPin(PinRuntimeState &pinState, int value, int brightness);
 int resolvePhysicalLevel(const PinRuntimeState &pinState, int logicalValue);
+#if ECONNECT_WIFI_SCAN_BEFORE_CONNECT
 WifiTarget scanWifiTarget();
 void logVisibleWifiTargets(const WifiTarget &target);
 void formatBssid(const uint8_t *bssid, char *buffer, size_t bufferSize);
+#endif
 const char *getActiveWifiSsid();
 const char *wifiPassphrase();
 size_t totalReportedPinCount();
@@ -176,6 +223,7 @@ void logConnectivitySnapshot(const char *context);
 void markMqttConnectionFaulted(const char *context);
 bool publishMqttPayload(const String &topic, const String &payload,
                         const char *context);
+void logPublishedPayload(const char *context, const String &payload);
 
 void setup() {
   Serial.begin(115200);
@@ -346,18 +394,23 @@ bool connectToWiFi() {
   prepareBoardForWifiConnection();
   delay(250);
 
-  const WifiTarget target = scanWifiTarget();
-  logVisibleWifiTargets(target);
-
   auto awaitWifiConnection = []() {
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < WIFI_RETRY_LIMIT) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
+    const unsigned long startedAt = millis();
+    unsigned long lastDotAt = 0;
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+      delay(50);
+      if (millis() - lastDotAt >= 500) {
+        Serial.print(".");
+        lastDotAt = millis();
+      }
     }
     return WiFi.status() == WL_CONNECTED;
   };
+
+#if ECONNECT_WIFI_SCAN_BEFORE_CONNECT
+  const WifiTarget target = scanWifiTarget();
+  logVisibleWifiTargets(target);
 
   auto beginWifiConnection = [&](bool useLockedTarget, bool useChannelHint) {
     Serial.printf("Connecting to Wi-Fi SSID: %s ", getActiveWifiSsid());
@@ -402,6 +455,12 @@ bool connectToWiFi() {
     delay(500);
     connected = beginWifiConnection(true, true);
   }
+#else
+  Serial.printf("Connecting to Wi-Fi SSID: %s (broadcast lookup) ",
+                getActiveWifiSsid());
+  WiFi.begin(getActiveWifiSsid(), wifiPassphrase());
+  const bool connected = awaitWifiConnection();
+#endif
 
   if (connected) {
     Serial.println(" connected");
@@ -414,6 +473,7 @@ bool connectToWiFi() {
   return false;
 }
 
+#if ECONNECT_WIFI_SCAN_BEFORE_CONNECT
 WifiTarget scanWifiTarget() {
   WifiTarget target = {
       false, 0, 0, -127, defaultBoardAuthMode(), {0, 0, 0, 0, 0, 0},
@@ -467,6 +527,12 @@ void logVisibleWifiTargets(const WifiTarget &target) {
       boardAuthModeName(target.authMode), bssidBuffer);
 }
 
+void formatBssid(const uint8_t *bssid, char *buffer, size_t bufferSize) {
+  snprintf(buffer, bufferSize, "%02X:%02X:%02X:%02X:%02X:%02X", bssid[0],
+           bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+}
+#endif
+
 const char *getActiveWifiSsid() {
 #ifdef BOARD_JC3827W543
   if (jc3827w543_has_custom_wifi()) {
@@ -483,11 +549,6 @@ const char *wifiPassphrase() {
   }
 #endif
   return strlen(WIFI_PASS) > 0 ? WIFI_PASS : nullptr;
-}
-
-void formatBssid(const uint8_t *bssid, char *buffer, size_t bufferSize) {
-  snprintf(buffer, bufferSize, "%02X:%02X:%02X:%02X:%02X:%02X", bssid[0],
-           bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 }
 
 const char *wifiStatusName(wl_status_t status) {
@@ -1267,11 +1328,10 @@ void publishFailedCommandAck(const String &commandId) {
   String payload;
   serializeJson(doc, payload);
 
-  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
-    Serial.println("Published failed command acknowledgement payload:");
-    Serial.println(payload);
-  } else {
-    Serial.println("Failed to publish failed command acknowledgement payload.");
+  if (publishMqttPayload(stateTopic, payload,
+                         "Failed command acknowledgement")) {
+    logPublishedPayload("Published failed command acknowledgement payload",
+                        payload);
   }
 }
 
@@ -1311,11 +1371,10 @@ void publishPinCommandAckState(const EConnectPinConfig &config,
   String payload;
   serializeJson(doc, payload);
 
-  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
-    Serial.println("Published fast command acknowledgement payload:");
-    Serial.println(payload);
-  } else {
-    Serial.println("Failed to publish fast command acknowledgement payload.");
+  if (publishMqttPayload(stateTopic, payload,
+                         "Fast command acknowledgement")) {
+    logPublishedPayload("Published fast command acknowledgement payload",
+                        payload);
   }
 }
 
@@ -1341,12 +1400,10 @@ void publishBuiltinCommandAckState(const String &commandId) {
   String payload;
   serializeJson(doc, payload);
 
-  if (mqttClient.publish(stateTopic.c_str(), payload.c_str())) {
-    Serial.println("Published fast built-in command acknowledgement payload:");
-    Serial.println(payload);
-  } else {
-    Serial.println(
-        "Failed to publish fast built-in command acknowledgement payload.");
+  if (publishMqttPayload(stateTopic, payload,
+                         "Fast built-in command acknowledgement")) {
+    logPublishedPayload(
+        "Published fast built-in command acknowledgement payload", payload);
   }
 }
 #endif
@@ -1374,35 +1431,16 @@ void publishState(bool applied) {
   const String stateTopic =
       String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
 
-  DynamicJsonDocument doc(4096);
+  const bool compactHeartbeat = !applied;
+  DynamicJsonDocument doc(compactHeartbeat ? 2048 : 4096);
   appendStateEnvelope(doc, applied);
 
   JsonArray pins = doc.createNestedArray("pins");
   for (size_t index = 0; index < PIN_CONFIG_COUNT; index++) {
     PinRuntimeState &pinState = pinStates[index];
     JsonObject pin = pins.createNestedObject();
-    pin["pin"] = pinState.gpio;
-    pin["mode"] = pinState.mode;
-    const int runtimeValue = readRuntimeValue(pinState);
-    pin["value"] = runtimeValue;
-    if (isOutputMode(pinState.mode)) {
-      pin["active_level"] = pinState.activeLevel;
-    }
-    appendPinConfigMetadata(pin, ECONNECT_PIN_CONFIGS[index]);
-
-    if (strcmp(ECONNECT_PIN_CONFIGS[index].input_type, "dht") == 0) {
-      if (!isnan(pinState.temperature)) {
-        pin["temperature"] = serialized(String(pinState.temperature, 1));
-      }
-      if (!isnan(pinState.humidity)) {
-        pin["humidity"] = serialized(String(pinState.humidity, 1));
-      }
-    }
-
-    const int brightness = readRuntimeBrightness(pinState);
-    if (brightness > 0 || isPwmMode(pinState.mode)) {
-      pin["brightness"] = brightness;
-    }
+    appendRuntimePinState(pin, pinState, ECONNECT_PIN_CONFIGS[index],
+                          !compactHeartbeat);
   }
 #ifdef BOARD_JC3827W543
   jc3827w543_append_builtin_pin_state(pins);
@@ -1440,8 +1478,42 @@ void publishState(bool applied) {
   if (publishMqttPayload(stateTopic, payload,
                          applied ? "Applied state payload"
                                  : "Heartbeat state payload")) {
-    Serial.println("Published state payload:");
-    Serial.println(payload);
+    logPublishedPayload(applied ? "Published applied state payload"
+                                : "Published heartbeat state payload",
+                        payload);
+  }
+}
+
+void appendRuntimePinState(JsonObject pin, PinRuntimeState &pinState,
+                           const EConnectPinConfig &config,
+                           bool includeMetadata) {
+  pin["pin"] = pinState.gpio;
+  if (includeMetadata) {
+    pin["mode"] = pinState.mode;
+  }
+
+  const int runtimeValue = readRuntimeValue(pinState);
+  pin["value"] = runtimeValue;
+
+  if (includeMetadata) {
+    if (isOutputMode(pinState.mode)) {
+      pin["active_level"] = pinState.activeLevel;
+    }
+    appendPinConfigMetadata(pin, config);
+  }
+
+  if (strcmp(config.input_type, "dht") == 0) {
+    if (!isnan(pinState.temperature)) {
+      pin["temperature"] = serialized(String(pinState.temperature, 1));
+    }
+    if (!isnan(pinState.humidity)) {
+      pin["humidity"] = serialized(String(pinState.humidity, 1));
+    }
+  }
+
+  const int brightness = readRuntimeBrightness(pinState);
+  if (brightness > 0 || isPwmMode(pinState.mode)) {
+    pin["brightness"] = brightness;
   }
 }
 
@@ -1555,4 +1627,15 @@ void requireManualReflash(JsonVariantConst runtimeNetwork,
                                                  : "(unknown)",
                   runtimeMqttPort);
   }
+}
+
+void logPublishedPayload(const char *context, const String &payload) {
+#if ECONNECT_DEBUG_SERIAL
+  Serial.printf("%s (%u bytes):\n", context,
+                static_cast<unsigned int>(payload.length()));
+  Serial.println(payload);
+#else
+  Serial.printf("%s (%u bytes).\n", context,
+                static_cast<unsigned int>(payload.length()));
+#endif
 }

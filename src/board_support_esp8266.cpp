@@ -6,6 +6,10 @@
 #include <user_interface.h>
 #include <WiFiClientSecureBearSSL.h>
 
+#ifndef ECONNECT_WIFI_SLEEP
+#define ECONNECT_WIFI_SLEEP 0
+#endif
+
 namespace {
 constexpr uint32_t kRuntimeFlagsMagic = 0x45434E54;  // "ECNT"
 constexpr uint32_t kRuntimeFlagsVersion = 1;
@@ -74,7 +78,11 @@ void initializeBoardNetworking() {
 void prepareBoardForWifiConnection() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
+#if ECONNECT_WIFI_SLEEP
+  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+#else
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
   WiFi.disconnect();
 }
 
