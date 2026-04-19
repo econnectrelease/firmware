@@ -4,4 +4,4 @@
 
 // Developer-managed firmware revision. Bump this only when the firmware source
 // changes.
-#define ECONNECT_FIRMWARE_REVISION "1.1.8"
+#define ECONNECT_FIRMWARE_REVISION "1.1.9"
