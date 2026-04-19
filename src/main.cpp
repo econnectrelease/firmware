@@ -19,12 +19,7 @@
 #endif
 #include "secrets.h"
 
-#ifdef BOARD_JC3827W543
-#include "jc3827w543_manager.h"
-#define DEVICE_MODE_STRING "portableDashboard"
-#else
 #define DEVICE_MODE_STRING "no-code"
-#endif
 
 #ifndef ECONNECT_FIRMWARE_REVISION
 #define ECONNECT_FIRMWARE_REVISION "1.0.0"
@@ -168,9 +163,7 @@ void publishFailedCommandAck(const String &commandId);
 void publishPinCommandAckState(const EConnectPinConfig &config,
                                const PinRuntimeState &pinState,
                                const String &commandId);
-#ifdef BOARD_JC3827W543
-void publishBuiltinCommandAckState(const String &commandId);
-#endif
+
 void queueDeferredStatePublish(bool applied);
 void flushDeferredStatePublish();
 String commandTopic();
@@ -247,10 +240,7 @@ void setup() {
   Serial.printf("Provisioned MQTT broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
   Serial.printf("Provisioned API base URL: %s\n", API_BASE_URL);
 
-#ifdef BOARD_JC3827W543
-  jc3827w543_setup();
-  jc3827w543_set_pairing_state(false);
-#endif
+
 
   while (!connectToWiFi()) {
     Serial.println("Wi-Fi provisioning failed. Retrying...");
@@ -340,9 +330,7 @@ void loop() {
     return;
   }
 
-#ifdef BOARD_JC3827W543
-  jc3827w543_loop();
-#endif
+
 
   if (!securePairingVerified) {
     securePairingVerified = performSecureHandshake();
@@ -366,11 +354,7 @@ void loop() {
     markMqttConnectionFaulted("mqttClient.loop()");
   }
 
-#ifdef BOARD_JC3827W543
-  if (mqttClient.connected()) {
-    jc3827w543_publish_pending_command(mqttClient);
-  }
-#endif
+
 
   flushDeferredStatePublish();
 
@@ -534,20 +518,12 @@ void formatBssid(const uint8_t *bssid, char *buffer, size_t bufferSize) {
 #endif
 
 const char *getActiveWifiSsid() {
-#ifdef BOARD_JC3827W543
-  if (jc3827w543_has_custom_wifi()) {
-    return jc3827w543_get_custom_ssid();
-  }
-#endif
+
   return WIFI_SSID;
 }
 
 const char *wifiPassphrase() {
-#ifdef BOARD_JC3827W543
-  if (jc3827w543_has_custom_wifi()) {
-    return jc3827w543_get_custom_pass();
-  }
-#endif
+
   return strlen(WIFI_PASS) > 0 ? WIFI_PASS : nullptr;
 }
 
@@ -663,9 +639,7 @@ bool performSecureHandshake() {
     pin["mode"] = ECONNECT_PIN_CONFIGS[index].mode;
     appendPinConfigMetadata(pin, ECONNECT_PIN_CONFIGS[index]);
   }
-#ifdef BOARD_JC3827W543
-  jc3827w543_append_builtin_pin_config(pins);
-#endif
+
 
   String requestBody;
   serializeJson(doc, requestBody);
@@ -787,9 +761,7 @@ void reconnectMQTT() {
     subscribeStateAckTopic();
     if (securePairingVerified) {
       subscribeCommandTopic();
-#ifdef BOARD_JC3827W543
-      jc3827w543_on_mqtt_connected(mqttClient);
-#endif
+
       publishState(true);
       lastHeartbeatAt = millis();
     }
@@ -818,11 +790,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   }
 
   const String incomingTopic = String(topic);
-#ifdef BOARD_JC3827W543
-  if (jc3827w543_handle_mqtt_message(topic, doc.as<JsonVariantConst>())) {
-    return;
-  }
-#endif
+
   if (incomingTopic == registerAckTopic()) {
     if (String(doc["status"] | "") == "manual_reflash_required" ||
         runtimeNetworkDiffers(doc["runtime_network"])) {
@@ -853,10 +821,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
     subscribeRegisterAckTopic();
     subscribeStateAckTopic();
     subscribeCommandTopic();
-#ifdef BOARD_JC3827W543
-    jc3827w543_set_pairing_state(true);
-    jc3827w543_on_mqtt_connected(mqttClient);
-#endif
+
     publishState(true);
     lastHeartbeatAt = millis();
     Serial.printf("Secure MQTT handshake complete. Device id: %s\n",
@@ -880,9 +845,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
       forcePairingRequestOnNextHandshake = false;
       securePairingVerified = false;
       persistRejectedPairingLock(true);
-#ifdef BOARD_JC3827W543
-      jc3827w543_set_pairing_state(false);
-#endif
+
       if (mqttClient.connected()) {
         mqttClient.disconnect();
       }
@@ -902,9 +865,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
       forcePairingRequestOnNextHandshake = true;
       securePairingVerified = false;
       persistRejectedPairingLock(false);
-#ifdef BOARD_JC3827W543
-      jc3827w543_set_pairing_state(false);
-#endif
+
       Serial.printf("Server requested re-pair: %s\n",
                     String(doc["message"] | "Unknown reason").c_str());
     }
@@ -986,19 +947,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   const int brightness = doc["brightness"] | -1;
   const String commandId = doc["command_id"] | "";
 
-#ifdef BOARD_JC3827W543
-  if (jc3827w543_is_builtin_pin(targetPin)) {
-    const bool applied =
-        jc3827w543_apply_builtin_command(targetPin, value, brightness);
-    if (applied) {
-      publishBuiltinCommandAckState(commandId);
-      queueDeferredStatePublish(true);
-    } else {
-      publishFailedCommandAck(commandId);
-    }
-    return;
-  }
-#endif
+
 
   const int pinIndex = findPinIndex(targetPin);
   if (pinIndex < 0) {
@@ -1378,35 +1327,7 @@ void publishPinCommandAckState(const EConnectPinConfig &config,
   }
 }
 
-#ifdef BOARD_JC3827W543
-void publishBuiltinCommandAckState(const String &commandId) {
-  if (!mqttClient.connected()) {
-    return;
-  }
 
-  const String stateTopic =
-      String("econnect/") + MQTT_NAMESPACE + "/device/" + deviceId + "/state";
-
-  DynamicJsonDocument doc(1024);
-  appendStateEnvelope(doc, true, &commandId);
-  doc["pin"] = jc3827w543_builtin_pin();
-  doc["mode"] = "PWM";
-  doc["value"] = jc3827w543_builtin_value();
-  doc["brightness"] = jc3827w543_builtin_brightness();
-
-  JsonArray pins = doc.createNestedArray("pins");
-  jc3827w543_append_builtin_pin_state(pins);
-
-  String payload;
-  serializeJson(doc, payload);
-
-  if (publishMqttPayload(stateTopic, payload,
-                         "Fast built-in command acknowledgement")) {
-    logPublishedPayload(
-        "Published fast built-in command acknowledgement payload", payload);
-  }
-}
-#endif
 
 void queueDeferredStatePublish(bool applied) {
   deferredStatePublishPending = true;
@@ -1442,18 +1363,10 @@ void publishState(bool applied) {
     appendRuntimePinState(pin, pinState, ECONNECT_PIN_CONFIGS[index],
                           !compactHeartbeat);
   }
-#ifdef BOARD_JC3827W543
-  jc3827w543_append_builtin_pin_state(pins);
-#endif
+
 
   if (totalReportedPinCount() == 1) {
-#ifdef BOARD_JC3827W543
-    if (PIN_CONFIG_COUNT == 0) {
-      doc["pin"] = jc3827w543_builtin_pin();
-      doc["value"] = jc3827w543_builtin_value();
-      doc["brightness"] = jc3827w543_builtin_brightness();
-    } else
-#endif
+
     {
       PinRuntimeState &pinState = pinStates[0];
       doc["pin"] = pinState.gpio;
@@ -1568,9 +1481,7 @@ void appendPinConfigMetadata(JsonObject pin, const EConnectPinConfig &config) {
 
 size_t totalReportedPinCount() {
   size_t reportedPinCount = PIN_CONFIG_COUNT;
-#ifdef BOARD_JC3827W543
-  reportedPinCount += 1;
-#endif
+
   return reportedPinCount;
 }
 
