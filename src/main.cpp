@@ -6,6 +6,7 @@
 #include <MD5Builder.h>
 #include <PubSubClient.h>
 #include <Wire.h>
+#include <math.h>
 
 #ifdef ECONNECT_HAS_DHT
 #include <DHT.h>
@@ -22,7 +23,7 @@
 #define DEVICE_MODE_STRING "no-code"
 
 #ifndef ECONNECT_FIRMWARE_REVISION
-#define ECONNECT_FIRMWARE_REVISION "1.0.0"
+#define ECONNECT_FIRMWARE_REVISION "1.1.10"
 #endif
 
 #ifndef ECONNECT_DEBUG_SERIAL
@@ -35,6 +36,18 @@
 
 #ifndef ECONNECT_HEARTBEAT_INTERVAL_MS
 #define ECONNECT_HEARTBEAT_INTERVAL_MS 5000UL
+#endif
+
+#ifndef ECONNECT_TELEMETRY_INTERVAL_MS
+#define ECONNECT_TELEMETRY_INTERVAL_MS 200UL
+#endif
+
+#ifndef ECONNECT_TACHOMETER_SAMPLE_WINDOW_MS
+#define ECONNECT_TACHOMETER_SAMPLE_WINDOW_MS 200UL
+#endif
+
+#ifndef ECONNECT_DHT_SAMPLE_INTERVAL_MS
+#define ECONNECT_DHT_SAMPLE_INTERVAL_MS 2000UL
 #endif
 
 #ifndef ECONNECT_HANDSHAKE_RETRY_DELAY_MS
@@ -87,6 +100,12 @@ static const EConnectPinConfig ECONNECT_PIN_CONFIGS[] = {
 
 constexpr unsigned long HEARTBEAT_INTERVAL_MS =
     ECONNECT_HEARTBEAT_INTERVAL_MS;
+constexpr unsigned long TELEMETRY_INTERVAL_MS =
+    ECONNECT_TELEMETRY_INTERVAL_MS;
+constexpr unsigned long TACHOMETER_SAMPLE_WINDOW_MS =
+    ECONNECT_TACHOMETER_SAMPLE_WINDOW_MS;
+constexpr unsigned long DHT_SAMPLE_INTERVAL_MS =
+    ECONNECT_DHT_SAMPLE_INTERVAL_MS;
 constexpr unsigned long HANDSHAKE_RETRY_DELAY_MS =
     ECONNECT_HANDSHAKE_RETRY_DELAY_MS;
 constexpr unsigned long HANDSHAKE_ACK_TIMEOUT_MS =
@@ -145,6 +164,7 @@ void IRAM_ATTR tachoInterruptHandler(void *arg) {
 
 String deviceId = ECONNECT_DEVICE_ID;
 unsigned long lastHeartbeatAt = 0;
+unsigned long lastTelemetryPublishAt = 0;
 bool securePairingVerified = false;
 bool forcePairingRequestOnNextHandshake = false;
 bool pairingRejectedUntilPowerCycle = false;
@@ -152,6 +172,7 @@ bool manualReflashRequired = false;
 unsigned long lastReconnectAttemptAt = 0;
 bool deferredStatePublishPending = false;
 bool deferredStatePublishApplied = false;
+bool telemetryStateDirty = false;
 
 bool connectToWiFi();
 bool performSecureHandshake();
@@ -185,6 +206,7 @@ bool isOutputMode(const char *mode);
 bool isPwmMode(const char *mode);
 bool isNumericInputMode(const char *mode, const char *inputType);
 bool isReadableMode(const char *mode);
+bool pinSupportsRealtimeTelemetry(const EConnectPinConfig &config);
 bool isPwmInverted(const PinRuntimeState &pinState);
 int pwmLowerBound(const PinRuntimeState &pinState);
 int pwmUpperBound(const PinRuntimeState &pinState);
@@ -194,6 +216,8 @@ int clampPwmBrightness(const PinRuntimeState &pinState, int brightness);
 int resolvePwmLogicalValue(const PinRuntimeState &pinState, int brightness);
 int readRuntimeValue(PinRuntimeState &pinState);
 int readRuntimeBrightness(PinRuntimeState &pinState);
+bool telemetryFloatChanged(float previousValue, float nextValue);
+bool refreshRealtimeTelemetryInputs();
 bool applyCommandToPin(PinRuntimeState &pinState, int value, int brightness);
 int resolvePhysicalLevel(const PinRuntimeState &pinState, int logicalValue);
 #if ECONNECT_WIFI_SCAN_BEFORE_CONNECT
@@ -358,9 +382,20 @@ void loop() {
 
   flushDeferredStatePublish();
 
+  if (refreshRealtimeTelemetryInputs()) {
+    telemetryStateDirty = true;
+  }
+
+  if (telemetryStateDirty &&
+      millis() - lastTelemetryPublishAt >= TELEMETRY_INTERVAL_MS) {
+    publishState(true);
+    if (mqttClient.connected()) {
+      telemetryStateDirty = false;
+    }
+  }
+
   if (millis() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
     publishState(false);
-    lastHeartbeatAt = millis();
   }
 
   updateInputs();
@@ -1101,6 +1136,16 @@ bool isReadableMode(const char *mode) {
          modeEquals(mode, "I2C");
 }
 
+bool pinSupportsRealtimeTelemetry(const EConnectPinConfig &config) {
+  if (modeEquals(config.mode, "ADC")) {
+    return true;
+  }
+
+  return modeEquals(config.mode, "INPUT") &&
+         (strcmp(config.input_type, "dht") == 0 ||
+          strcmp(config.input_type, "tachometer") == 0);
+}
+
 bool isPwmInverted(const PinRuntimeState &pinState) {
   return pinState.pwmMin > pinState.pwmMax;
 }
@@ -1152,7 +1197,7 @@ int readRuntimeValue(PinRuntimeState &pinState) {
 #ifdef ECONNECT_HAS_DHT
         if (dhtSensors[index] != nullptr) {
           unsigned long now = millis();
-          if (now - lastDHTReadTime[index] >= 2000) {
+          if (now - lastDHTReadTime[index] >= DHT_SAMPLE_INTERVAL_MS) {
             float t = dhtSensors[index]->readTemperature();
             float h = dhtSensors[index]->readHumidity();
             if (!isnan(t)) {
@@ -1171,7 +1216,7 @@ int readRuntimeValue(PinRuntimeState &pinState) {
                  0) {
         unsigned long now = millis();
         unsigned long elapsed = now - lastTachoReadTime[index];
-        if (elapsed >= 1000) {
+        if (elapsed >= TACHOMETER_SAMPLE_WINDOW_MS) {
           noInterrupts();
           unsigned long pulses = tachoPulseCounts[index];
           tachoPulseCounts[index] = 0;
@@ -1204,6 +1249,42 @@ int readRuntimeValue(PinRuntimeState &pinState) {
 
 int readRuntimeBrightness(PinRuntimeState &pinState) {
   return isPwmMode(pinState.mode) ? pinState.brightness : 0;
+}
+
+bool telemetryFloatChanged(float previousValue, float nextValue) {
+  if (isnan(previousValue) && isnan(nextValue)) {
+    return false;
+  }
+  if (isnan(previousValue) || isnan(nextValue)) {
+    return true;
+  }
+  return fabs(previousValue - nextValue) >= 0.05f;
+}
+
+bool refreshRealtimeTelemetryInputs() {
+  bool stateChanged = false;
+
+  for (size_t index = 0; index < PIN_CONFIG_COUNT; index++) {
+    const EConnectPinConfig &config = ECONNECT_PIN_CONFIGS[index];
+    if (!pinSupportsRealtimeTelemetry(config)) {
+      continue;
+    }
+
+    PinRuntimeState &pinState = pinStates[index];
+    const int previousValue = pinState.value;
+    const float previousTemperature = pinState.temperature;
+    const float previousHumidity = pinState.humidity;
+
+    const int nextValue = readRuntimeValue(pinState);
+
+    if (nextValue != previousValue ||
+        telemetryFloatChanged(previousTemperature, pinState.temperature) ||
+        telemetryFloatChanged(previousHumidity, pinState.humidity)) {
+      stateChanged = true;
+    }
+  }
+
+  return stateChanged;
 }
 
 bool applyCommandToPin(PinRuntimeState &pinState, int value, int brightness) {
@@ -1279,6 +1360,7 @@ void publishFailedCommandAck(const String &commandId) {
 
   if (publishMqttPayload(stateTopic, payload,
                          "Failed command acknowledgement")) {
+    lastHeartbeatAt = millis();
     logPublishedPayload("Published failed command acknowledgement payload",
                         payload);
   }
@@ -1322,6 +1404,9 @@ void publishPinCommandAckState(const EConnectPinConfig &config,
 
   if (publishMqttPayload(stateTopic, payload,
                          "Fast command acknowledgement")) {
+    const unsigned long publishedAt = millis();
+    lastHeartbeatAt = publishedAt;
+    lastTelemetryPublishAt = publishedAt;
     logPublishedPayload("Published fast command acknowledgement payload",
                         payload);
   }
@@ -1391,6 +1476,11 @@ void publishState(bool applied) {
   if (publishMqttPayload(stateTopic, payload,
                          applied ? "Applied state payload"
                                  : "Heartbeat state payload")) {
+    const unsigned long publishedAt = millis();
+    lastHeartbeatAt = publishedAt;
+    if (applied) {
+      lastTelemetryPublishAt = publishedAt;
+    }
     logPublishedPayload(applied ? "Published applied state payload"
                                 : "Published heartbeat state payload",
                         payload);
