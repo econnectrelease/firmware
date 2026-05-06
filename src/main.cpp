@@ -23,7 +23,7 @@
 #define DEVICE_MODE_STRING "no-code"
 
 #ifndef ECONNECT_FIRMWARE_REVISION
-#define ECONNECT_FIRMWARE_REVISION "1.1.10"
+#define ECONNECT_FIRMWARE_REVISION "1.1.11"
 #endif
 
 #ifndef ECONNECT_DEBUG_SERIAL
@@ -63,7 +63,7 @@
 #endif
 
 #ifndef ECONNECT_MQTT_KEEPALIVE_SECONDS
-#define ECONNECT_MQTT_KEEPALIVE_SECONDS 10
+#define ECONNECT_MQTT_KEEPALIVE_SECONDS 60
 #endif
 
 #ifndef ECONNECT_MQTT_SOCKET_TIMEOUT_SECONDS
@@ -786,11 +786,13 @@ void reconnectMQTT() {
 
   String clientId = "econnect-";
   clientId += deviceId;
-  clientId += "-";
-  clientId += String(random(0xffff), HEX);
 
   logConnectivitySnapshot("Attempting MQTT reconnect");
-  if (mqttClient.connect(clientId.c_str())) {
+  if (mqttClient.connect(clientId.c_str(),
+                         /*user*/ nullptr, /*pass*/ nullptr,
+                         /*willTopic*/ nullptr, /*willQos*/ 0,
+                         /*willRetain*/ false, /*willMessage*/ nullptr,
+                         /*cleanSession*/ false)) {
     Serial.println("MQTT connected.");
     subscribeRegisterAckTopic();
     subscribeStateAckTopic();
