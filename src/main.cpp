@@ -400,6 +400,38 @@ void loop() {
 
   updateInputs();
 
+#ifdef ECONNECT_BATTERY_MODE
+  if (securePairingVerified && mqttClient.connected()) {
+    mqttClient.loop();
+    delay(100); // Give MQTT some time to flush the published messages
+
+#ifndef ECONNECT_DEEP_SLEEP_INTERVAL_S
+#define ECONNECT_DEEP_SLEEP_INTERVAL_S 60
+#endif
+
+#ifndef ECONNECT_SLEEP_MODE
+#define ECONNECT_SLEEP_MODE 2
+#endif
+
+#if ECONNECT_SLEEP_MODE == 2
+    // Mode 2: Deep Sleep (Max Power Saving)
+    // Safe for pure sensors that don't need continuous connection or instant interaction.
+    enterDeepSleep(ECONNECT_DEEP_SLEEP_INTERVAL_S);
+#elif ECONNECT_SLEEP_MODE == 1
+    // Mode 1: Light/Modem Sleep (Switches or Actuators)
+    // We cannot enter explicit deep/light sleep that halts the CPU and drops Wi-Fi,
+    // otherwise we lose real-time control and miss button presses.
+    // By using a small delay, we yield to the OS, allowing the ESP SDK's
+    // automatic Modem Sleep to reduce power (~20-30mA) while keeping MQTT alive.
+    delay(50);
+#else
+    // Mode 0: PWM active
+    // We must keep CPU awake to maintain smooth PWM signal generation.
+    delay(10);
+#endif
+  }
+#endif
+
   delay(10);
 }
 

@@ -161,4 +161,32 @@ void shutdownBoardNetworkingAfterPairingReject() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 }
+
+void assessAndConfigureULP() {
+  Serial.println("ULP is NOT supported on ESP8266.");
+}
+
+void enterDeepSleep(uint64_t sleepTimeSeconds) {
+  Serial.printf("Entering Deep Sleep for %llu seconds. (Ensure D0 is connected to RST to wake up)\n", sleepTimeSeconds);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  ESP.deepSleep(sleepTimeSeconds * 1000000ULL);
+}
+
+void enterLightSleep(uint64_t sleepTimeSeconds) {
+  Serial.printf("Entering Light Sleep for %llu seconds...\n", sleepTimeSeconds);
+  
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  wifi_fpm_set_sleep_type(LIGHT_SLEEP_T);
+  wifi_fpm_open();
+  wifi_fpm_do_sleep(sleepTimeSeconds * 1000000ULL);
+  delay(sleepTimeSeconds * 1000ULL);
+  
+  Serial.println("Woke up from Light Sleep. Re-enabling Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+}
+
 #endif

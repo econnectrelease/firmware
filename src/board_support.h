@@ -36,3 +36,6 @@ bool restoreRejectedPairingLock();
 void persistRejectedPairingLock(bool rejected);
 String boardResetReasonSummary();
 void shutdownBoardNetworkingAfterPairingReject();
+void enterDeepSleep(uint64_t sleepTimeSeconds);
+void enterLightSleep(uint64_t sleepTimeSeconds);
+void assessAndConfigureULP();

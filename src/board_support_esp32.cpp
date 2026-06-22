@@ -226,4 +226,47 @@ void shutdownBoardNetworkingAfterPairingReject() {
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
 }
+
+void assessAndConfigureULP() {
+#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  // ULP allows the chip to run a low-power coprocessor while the main core is asleep.
+  Serial.println("ULP supported on this board. ULP logic can be enabled here.");
+#else
+  Serial.println("ULP is NOT supported on this specific ESP32 variant (e.g. ESP32-C3).");
+#endif
+}
+
+void enterDeepSleep(uint64_t sleepTimeSeconds) {
+  Serial.printf("Entering Deep Sleep for %llu seconds...\n", sleepTimeSeconds);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  
+  esp_sleep_enable_timer_wakeup(sleepTimeSeconds * 1000000ULL);
+  
+  assessAndConfigureULP();
+  
+  esp_deep_sleep_start();
+}
+
+void enterLightSleep(uint64_t sleepTimeSeconds) {
+  Serial.printf("Entering Light Sleep for %llu seconds...\n", sleepTimeSeconds);
+  
+  // Optionally disconnect Wi-Fi to save more power during light sleep
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+
+  // Preserve GPIO states (if there are active outputs)
+  gpio_hold_en((gpio_num_t)ECONNECT_BUILTIN_LED_PIN);
+  // Actually, we could enable rtc_gpio_hold on all outputs, but light sleep
+  // naturally retains digital pin states on ESP32 without explicit hold.
+  
+  esp_sleep_enable_timer_wakeup(sleepTimeSeconds * 1000000ULL);
+  esp_light_sleep_start();
+
+  // We are awake!
+  Serial.println("Woke up from Light Sleep. Re-enabling Wi-Fi...");
+  WiFi.mode(WIFI_STA);
+  // Loop will handle reconnect
+}
+
 #endif
