@@ -90,11 +90,14 @@ struct EConnectPinConfig {
   const char *input_type;
   const char *switch_type;
   const char *dht_version;
+  float adc_max_voltage;
+  float adc_r1;
+  float adc_r2;
 };
 
 static const EConnectPinConfig ECONNECT_PIN_CONFIGS[] = {
     {ECONNECT_BUILTIN_LED_PIN, "OUTPUT", "builtin_led", "Built-in LED", 1, 0,
-     255, "", "", "", "", "switch", "momentary", ""},
+     255, "", "", "", "", "switch", "momentary", "", 0.0, 0.0, 0.0},
 };
 #endif
 
@@ -133,6 +136,7 @@ struct PinRuntimeState {
   unsigned long lastDebounceTime;
   float temperature;
   float humidity;
+  float voltage;
 };
 
 constexpr size_t PIN_CONFIG_COUNT =
@@ -1053,6 +1057,7 @@ void initializePinStates() {
     pinStates[index].lastDebounceTime = 0;
     pinStates[index].temperature = NAN;
     pinStates[index].humidity = NAN;
+    pinStates[index].voltage = -1.0;
 
     if (isOutputMode(pinStates[index].mode)) {
       pinMode(pinStates[index].gpio, OUTPUT);
@@ -1221,6 +1226,21 @@ int readRuntimeValue(PinRuntimeState &pinState) {
 
   if (modeEquals(pinState.mode, "ADC")) {
     pinState.value = analogRead(pinState.gpio);
+    int index = findPinIndex(pinState.gpio);
+    if (index >= 0) {
+      const EConnectPinConfig &config = ECONNECT_PIN_CONFIGS[index];
+      if (config.adc_max_voltage > 0 && config.adc_r2 > 0) {
+#if defined(ESP8266)
+        float resolution = 1023.0;
+#else
+        float resolution = 4095.0;
+#endif
+        float v_out = ((float)pinState.value / resolution) * config.adc_max_voltage;
+        pinState.voltage = v_out * (config.adc_r1 + config.adc_r2) / config.adc_r2;
+      } else {
+        pinState.voltage = -1.0;
+      }
+    }
     return pinState.value;
   }
 
@@ -1498,6 +1518,9 @@ void publishState(bool applied) {
           doc["humidity"] = serialized(String(pinState.humidity, 1));
         }
       }
+      if (modeEquals(pinState.mode, "ADC") && pinState.voltage >= 0.0) {
+        doc["voltage"] = serialized(String(pinState.voltage, 2));
+      }
       if (isPwmMode(pinState.mode)) {
         doc["brightness"] = readRuntimeBrightness(pinState);
       }
@@ -1546,6 +1569,10 @@ void appendRuntimePinState(JsonObject pin, PinRuntimeState &pinState,
     if (!isnan(pinState.humidity)) {
       pin["humidity"] = serialized(String(pinState.humidity, 1));
     }
+  }
+
+  if (modeEquals(config.mode, "ADC") && pinState.voltage >= 0.0) {
+    pin["voltage"] = serialized(String(pinState.voltage, 2));
   }
 
   const int brightness = readRuntimeBrightness(pinState);
